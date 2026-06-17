@@ -1293,6 +1293,26 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
         return now;
     }
 
+    if (base_ros_stamp_.get_clock_type() != now.get_clock_type() ||
+        last_ros_stamp_.get_clock_type() != now.get_clock_type()) {
+        // The previous device->ROS baseline belongs to a different ROS clock
+        // epoch. Mixing clock types makes rclcpp::Time subtraction invalid and
+        // can publish timestamps with an undefined meaning, so fail the old
+        // mapping closed and start a new bounded mapping at this frame.
+        RCLCPP_WARN(
+            this->get_logger(),
+            "device->ROS time mapping re-anchored because ROS clock type changed "
+            "(base=%d last=%d now=%d)",
+            static_cast<int>(base_ros_stamp_.get_clock_type()),
+            static_cast<int>(last_ros_stamp_.get_clock_type()),
+            static_cast<int>(now.get_clock_type()));
+        base_device_ts_ms_ = device_ts_ms;
+        base_ros_stamp_ = now;
+        last_device_ts_ms_ = device_ts_ms;
+        last_ros_stamp_ = now;
+        return now;
+    }
+
     // Reset mapping if device timestamp jumps backwards significantly (device reset).
     if ((device_ts_ms + device_ts_reset_threshold_ms_) < last_device_ts_ms_) {
         base_device_ts_ms_ = device_ts_ms;
