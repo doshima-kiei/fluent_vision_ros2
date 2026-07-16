@@ -152,17 +152,25 @@ private:
     // the URDF publisher's horizon.
     //
     // Defence: drift_resync_ms_ caps how far the computed stamp may
-    // diverge from this->now() before the (base_device, base_ros)
-    // mapping is re-anchored to the present. With drift_resync_ms_ = 0
-    // we anchor every frame (= identical to use_device_timestamp_=false).
+    // diverge from this->now() before the device->ROS mapping is
+    // re-anchored to the present. With drift_resync_ms_ = 0 we anchor
+    // every frame (= identical to use_device_timestamp_=false).
+    //
+    // The mapping itself is `stamp = device_ts + anchor_offset_ns_`
+    // where anchor_offset_ns_ is the MINIMUM observed
+    // (processing-time − device-time) since the last (re)anchor. A fixed
+    // first-frame anchor would bake that frame's full pipeline latency
+    // (~45 ms measured: exposure settle + USB + queue + thread wakeup)
+    // into every stamp as a future bias; the running minimum instead
+    // pins the mapping to the lowest-latency frame, leaving a small
+    // positive (past-side) residual like any normal delivery delay.
     bool use_device_timestamp_ = true;
     double device_ts_reset_threshold_ms_ = 1000.0;
     double drift_resync_ms_ = 250.0;
     std::mutex device_time_mutex_;
     bool device_time_initialized_ = false;
     rs2_timestamp_domain device_time_domain_{RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK};
-    double base_device_ts_ms_ = 0.0;
-    rclcpp::Time base_ros_stamp_{0, 0, RCL_SYSTEM_TIME};
+    int64_t anchor_offset_ns_ = 0;
     double last_device_ts_ms_ = 0.0;
     rclcpp::Time last_ros_stamp_{0, 0, RCL_SYSTEM_TIME};
 

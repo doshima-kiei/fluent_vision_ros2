@@ -1281,20 +1281,20 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
 
     const auto domain = frame ? frame.get_frame_timestamp_domain() : RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK;
     const rclcpp::Time now = this->now();
+    const int64_t device_ns = static_cast<int64_t>(device_ts_ms * 1e6);
+    const int64_t offset_ns = now.nanoseconds() - device_ns;
 
     std::lock_guard<std::mutex> lk(device_time_mutex_);
     if (!device_time_initialized_ || domain != device_time_domain_) {
         device_time_initialized_ = true;
         device_time_domain_ = domain;
-        base_device_ts_ms_ = device_ts_ms;
-        base_ros_stamp_ = now;
+        anchor_offset_ns_ = offset_ns;
         last_device_ts_ms_ = device_ts_ms;
         last_ros_stamp_ = now;
         return now;
     }
 
-    if (base_ros_stamp_.get_clock_type() != now.get_clock_type() ||
-        last_ros_stamp_.get_clock_type() != now.get_clock_type()) {
+    if (last_ros_stamp_.get_clock_type() != now.get_clock_type()) {
         // The previous device->ROS baseline belongs to a different ROS clock
         // epoch. Mixing clock types makes rclcpp::Time subtraction invalid and
         // can publish timestamps with an undefined meaning, so fail the old
@@ -1302,12 +1302,10 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
         RCLCPP_WARN(
             this->get_logger(),
             "device->ROS time mapping re-anchored because ROS clock type changed "
-            "(base=%d last=%d now=%d)",
-            static_cast<int>(base_ros_stamp_.get_clock_type()),
+            "(last=%d now=%d)",
             static_cast<int>(last_ros_stamp_.get_clock_type()),
             static_cast<int>(now.get_clock_type()));
-        base_device_ts_ms_ = device_ts_ms;
-        base_ros_stamp_ = now;
+        anchor_offset_ns_ = offset_ns;
         last_device_ts_ms_ = device_ts_ms;
         last_ros_stamp_ = now;
         return now;
@@ -1315,16 +1313,26 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
 
     // Reset mapping if device timestamp jumps backwards significantly (device reset).
     if ((device_ts_ms + device_ts_reset_threshold_ms_) < last_device_ts_ms_) {
-        base_device_ts_ms_ = device_ts_ms;
-        base_ros_stamp_ = now;
+        anchor_offset_ns_ = offset_ns;
         last_device_ts_ms_ = device_ts_ms;
         last_ros_stamp_ = now;
         return now;
     }
 
-    const double dt_ms = device_ts_ms - base_device_ts_ms_;
-    const int64_t dt_ns = static_cast<int64_t>(dt_ms * 1e6);
-    rclcpp::Time stamp = base_ros_stamp_ + rclcpp::Duration(std::chrono::nanoseconds(dt_ns));
+    // Anchor refinement: a fixed first-frame anchor bakes that frame's full
+    // pipeline latency (exposure settle + USB transfer + queue dwell +
+    // thread wakeup; ~45 ms measured on D405) into every subsequent stamp
+    // as a constant FUTURE bias — downstream consumers then see
+    // header.stamp later than the frame's arrival time. Track the minimum
+    // observed (processing-time − device-time) offset instead: the mapping
+    // converges onto the lowest-latency frame seen so far, so the residual
+    // bias is the best-case transport latency with the physically correct
+    // sign (stamps slightly in the past, like any real delivery delay).
+    if (offset_ns < anchor_offset_ns_) {
+        anchor_offset_ns_ = offset_ns;
+    }
+
+    rclcpp::Time stamp(device_ns + anchor_offset_ns_, now.get_clock_type());
 
     // Drift guard: if the device-time-derived stamp diverges from ROS
     // time by more than drift_resync_ms_, re-anchor the baseline to the
@@ -1346,8 +1354,7 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
         const int64_t threshold_ns =
             static_cast<int64_t>(drift_resync_ms_ * 1e6);
         if (drift_ns > threshold_ns) {
-            base_device_ts_ms_ = device_ts_ms;
-            base_ros_stamp_ = now;
+            anchor_offset_ns_ = offset_ns;
             stamp = now;
             last_device_ts_ms_ = device_ts_ms;
             last_ros_stamp_ = now;
@@ -1365,7 +1372,9 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
         }
     }
 
-    if (stamp < last_ros_stamp_) {
+    if (stamp.nanoseconds() < last_ros_stamp_.nanoseconds()) {
+        // Keep stamps monotonic when a refinement step moves the anchor
+        // slightly backwards mid-stream.
         stamp = last_ros_stamp_;
     }
     last_device_ts_ms_ = device_ts_ms;
