@@ -30,6 +30,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #if __has_include(<cv_bridge/cv_bridge.h>)
 #include <cv_bridge/cv_bridge.h>
 #elif __has_include(<cv_bridge/cv_bridge.hpp>)
@@ -60,6 +61,18 @@ public:
         stride_           = get_param(*this, "stride",            1);
         frame_id_         = get_param(*this, "frame_id",          std::string(""));
         color_timeout_ms_ = get_param(*this, "color_timeout_ms",  1000);
+        // Depth subscription QoS: "sensor" (BEST_EFFORT) suits raw sensor
+        // streams; "reliable" is required for fv_* processing publishers
+        // whose large fragmented Image messages starve BEST_EFFORT
+        // delivery (e.g. LingBot refined depth at 614KB/frame).
+        depth_qos_        = get_param(*this, "depth_qos",         std::string("sensor"));
+        // Optional switchable secondary depth source (e.g. LingBot refined
+        // depth). Both sources stay subscribed; depth_source_topic
+        // (std_msgs/String, transient_local) selects which one feeds the
+        // cloud: "default"/"raw" = depth_topic, anything else = alt.
+        alt_depth_topic_    = get_param(*this, "alt_depth_topic",    std::string(""));
+        alt_depth_qos_      = get_param(*this, "alt_depth_qos",      std::string("reliable"));
+        depth_source_topic_ = get_param(*this, "depth_source_topic", std::string(""));
         // Max publish rate in Hz. 0 = unlimited (publish on every valid depth).
         // Throttling here keeps downstream consumers (octomap, foxglove_bridge)
         // from being starved by a 30Hz full-cloud firehose.
@@ -81,9 +94,39 @@ public:
         sub_info_ = create_subscription<sensor_msgs::msg::CameraInfo>(
             info_topic_, qos,
             [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) { on_info(m); });
+        auto depth_sub_qos = (depth_qos_ == "reliable")
+            ? rclcpp::QoS(1).reliable()
+            : rclcpp::QoS(rclcpp::SensorDataQoS());
         sub_depth_ = create_subscription<sensor_msgs::msg::Image>(
-            depth_topic_, qos,
-            [this](sensor_msgs::msg::Image::ConstSharedPtr m) { on_depth(m); });
+            depth_topic_, depth_sub_qos,
+            [this](sensor_msgs::msg::Image::ConstSharedPtr m) {
+                if (use_alt_depth_.load()) return;
+                on_depth(m);
+            });
+        if (!alt_depth_topic_.empty()) {
+            auto alt_sub_qos = (alt_depth_qos_ == "reliable")
+                ? rclcpp::QoS(1).reliable()
+                : rclcpp::QoS(rclcpp::SensorDataQoS());
+            sub_depth_alt_ = create_subscription<sensor_msgs::msg::Image>(
+                alt_depth_topic_, alt_sub_qos,
+                [this](sensor_msgs::msg::Image::ConstSharedPtr m) {
+                    if (!use_alt_depth_.load()) return;
+                    on_depth(m);
+                });
+            if (!depth_source_topic_.empty()) {
+                sub_depth_source_ = create_subscription<std_msgs::msg::String>(
+                    depth_source_topic_,
+                    rclcpp::QoS(1).reliable().transient_local(),
+                    [this](std_msgs::msg::String::ConstSharedPtr m) {
+                        const bool alt = (m->data != "default" && m->data != "raw");
+                        if (alt != use_alt_depth_.load()) {
+                            use_alt_depth_.store(alt);
+                            RCLCPP_INFO(get_logger(), "depth source -> %s",
+                                        alt ? alt_depth_topic_.c_str() : depth_topic_.c_str());
+                        }
+                    });
+            }
+        }
 
         // Point cloud is for high-rate visualization/preview: prefer BEST_EFFORT
         // to avoid backpressure and reduce latency on weak links.
@@ -140,7 +183,10 @@ private:
         }
         // Rate limiter: honor publish_hz_ by dropping depth frames that arrive
         // faster than the configured interval. Keeps octomap / foxglove_bridge
-        // from being saturated by a high-rate cloud.
+        // from being saturated by a high-rate cloud. last_publish_time_ is
+        // updated only when a cloud is actually published, so a frame that
+        // passes this gate but bails out later (stale color, no intrinsics,
+        // zero points) does not burn the slot and stretch the output gap.
         if (publish_hz_ > 0.0) {
             const auto now = this->get_clock()->now();
             const double min_interval_s = 1.0 / publish_hz_;
@@ -148,7 +194,6 @@ private:
                 const double since_last = (now - last_publish_time_).seconds();
                 if (since_last < min_interval_s) return;
             }
-            last_publish_time_ = now;
         }
 
         double fx, fy, cx, cy;
@@ -308,11 +353,16 @@ private:
         cloud.data.resize(data_size);
         std::memcpy(cloud.data.data(), points.data(), data_size);
 
+        if (publish_hz_ > 0.0) {
+            last_publish_time_ = this->get_clock()->now();
+        }
         pub_cloud_->publish(cloud);
     }
 
     // Parameters
-    std::string color_topic_, depth_topic_, info_topic_, cloud_topic_, frame_id_;
+    std::string color_topic_, depth_topic_, info_topic_, cloud_topic_, frame_id_, depth_qos_;
+    std::string alt_depth_topic_, alt_depth_qos_, depth_source_topic_;
+    std::atomic<bool> use_alt_depth_{false};
     double depth_scale_, min_depth_, max_depth_;
     int stride_;
     int color_timeout_ms_;
@@ -347,6 +397,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_color_;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_depth_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_depth_alt_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_depth_source_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_;
 };
 

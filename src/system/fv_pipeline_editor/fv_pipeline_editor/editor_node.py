@@ -19,8 +19,11 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -41,6 +44,7 @@ except ImportError:
     HAS_CV = False
 
 try:
+    import aiohttp
     from aiohttp import web
 except ImportError:
     print("[fv_pipeline_editor] ERROR: aiohttp not installed. "
@@ -245,6 +249,66 @@ def delete_pipeline_file(directory: str, name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Model library helpers (local models dir + ml-hub cloud)
+# ---------------------------------------------------------------------------
+MODEL_EXTENSIONS = {
+    '.pt': 'pytorch',
+    '.onnx': 'onnx',
+    '.xml': 'openvino',
+    '.engine': 'tensorrt',
+}
+
+# ml-hub delivery format -> models/ subdirectory
+MODEL_FORMAT_DIRS = {
+    'pt': 'yolo',
+    'onnx': 'onnx',
+    'openvino': 'openvino',
+}
+
+
+def scan_local_models(models_dir: str) -> List[Dict]:
+    """Enumerate model files under the models directory."""
+    models = []
+    if not models_dir or not os.path.isdir(models_dir):
+        return models
+    pattern = os.path.join(models_dir, '**', '*')
+    for path in sorted(globmod.glob(pattern, recursive=True)):
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in MODEL_EXTENSIONS or not os.path.isfile(path):
+            continue
+        models.append({
+            'name': os.path.relpath(path, models_dir),
+            'path': path,
+            'format': MODEL_EXTENSIONS[ext],
+            'size': os.path.getsize(path),
+        })
+    return models
+
+
+def safe_model_dirname(name: str) -> str:
+    """Turn a release id into a filesystem-safe directory name."""
+    cleaned = re.sub(r'[^\w\-.]+', '_', name)
+    return cleaned.strip('._') or 'model'
+
+
+def extract_model_zip(zip_path: str, extract_dir: str) -> str:
+    """Safely extract a model archive; return the primary model file path."""
+    base = os.path.abspath(extract_dir)
+    os.makedirs(base, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [m for m in zf.namelist() if not m.endswith('/')]
+        for member in members:
+            target = os.path.abspath(os.path.join(base, member))
+            if not target.startswith(base + os.sep):
+                raise RuntimeError(f'Unsafe zip entry: {member}')
+        zf.extractall(base)
+    for member in members:
+        if os.path.splitext(member)[1].lower() in MODEL_EXTENSIONS:
+            return os.path.join(base, member)
+    return base
+
+
+# ---------------------------------------------------------------------------
 # Main ROS2 Node
 # ---------------------------------------------------------------------------
 class FVPipelineEditorNode(Node):
@@ -263,8 +327,24 @@ class FVPipelineEditorNode(Node):
         self.declare_parameter('container_manifest_search_roots', [
             '/ros2_ws/src/fluent_vision_ros2/docker',
         ])
+        self.declare_parameter('models_dir', '')
+        self.declare_parameter('ml_hub_url', 'http://localhost:7000')
+        self.declare_parameter('ml_hub_token', '')
+        # 子ノードの RMW。既定 'rmw_cyclonedds_cpp' は fv_realsense の
+        # librealsense2 シンボル衝突回避 (fluent_vision 由来)。'' で親環境を
+        # 継承 — FastDDS プロファイル前提のスタック (aspa: D555 の 16MB
+        # 受信バッファ必須) では '' にしないと子が映像を受けられない。
+        self.declare_parameter('child_rmw_implementation', 'rmw_cyclonedds_cpp')
+        # launch 時に同名実行ファイルの「孤児」を pgrep -f で殺す挙動。
+        # 同じ実行ファイルをエディタ外でも常駐させるスタック (aspa の
+        # perception_node 等) では巻き添えになるので false にすること。
+        self.declare_parameter('kill_orphans_on_launch', True)
 
         self.port = self.get_parameter('port').value
+        self.child_rmw = str(
+            self.get_parameter('child_rmw_implementation').value).strip()
+        self.kill_orphans = bool(
+            self.get_parameter('kill_orphans_on_launch').value)
         self.pipeline_dir = self.get_parameter('pipeline_dir').value
         self.builtin_dir = self.get_parameter('builtin_dir').value
         self.manifest_roots = self.get_parameter('manifest_search_roots').value
@@ -279,6 +359,20 @@ class FVPipelineEditorNode(Node):
                 if os.path.isdir(candidate):
                     self.builtin_dir = candidate
                     break
+
+        # Models dir: explicit param, else models/ next to src/
+        self.models_dir = os.path.expanduser(
+            self.get_parameter('models_dir').value or '')
+        if not self.models_dir:
+            for root in self.manifest_roots:
+                candidate = os.path.join(
+                    os.path.dirname(os.path.expanduser(root)), 'models')
+                if os.path.isdir(candidate):
+                    self.models_dir = candidate
+                    break
+
+        self.ml_hub_url = (self.get_parameter('ml_hub_url').value or '').rstrip('/')
+        self.ml_hub_token = self.get_parameter('ml_hub_token').value or ''
 
         detected_container_roots = []
         for root in self.container_manifest_roots:
@@ -313,6 +407,7 @@ class FVPipelineEditorNode(Node):
 
         # Process management
         self._processes: Dict[str, subprocess.Popen] = {}
+        self._stderr_tails: Dict[str, list] = {}   # node_id -> 末尾ログ行
         self._process_lock = threading.Lock()
         self._containers: Dict[str, Dict[str, str]] = {}
         self._container_lock = threading.Lock()
@@ -331,6 +426,8 @@ class FVPipelineEditorNode(Node):
             f'FV Pipeline Editor starting on port {self.port}')
         self.get_logger().info(f'  Pipeline dir: {self.pipeline_dir}')
         self.get_logger().info(f'  Builtin dir: {self.builtin_dir}')
+        self.get_logger().info(f'  Models dir: {self.models_dir}')
+        self.get_logger().info(f'  ml-hub URL: {self.ml_hub_url}')
 
     # -----------------------------------------------------------------------
     # Web server
@@ -447,6 +544,9 @@ class FVPipelineEditorNode(Node):
             'get_container_logs': self._handle_get_container_logs,
             'subscribe_preview': self._handle_subscribe_preview,
             'unsubscribe_preview': self._handle_unsubscribe_preview,
+            'list_local_models': self._handle_list_local_models,
+            'list_cloud_models': self._handle_list_cloud_models,
+            'download_model': self._handle_download_model,
         }
 
         handler = handlers.get(msg_type)
@@ -871,6 +971,163 @@ class FVPipelineEditorNode(Node):
         })
 
     # -----------------------------------------------------------------------
+    # Model library (local models dir + ml-hub cloud)
+    # -----------------------------------------------------------------------
+    def _ml_hub_headers(self) -> Dict[str, str]:
+        if self.ml_hub_token:
+            return {'Authorization': f'Bearer {self.ml_hub_token}'}
+        return {}
+
+    async def _handle_list_local_models(self, ws, msg: Dict):
+        """List model files under the models directory."""
+        await ws.send_json({
+            'type': 'local_models',
+            'models': scan_local_models(self.models_dir),
+            'models_dir': self.models_dir,
+        })
+
+    async def _handle_list_cloud_models(self, ws, msg: Dict):
+        """List releases from the ml-hub model library."""
+        url = f'{self.ml_hub_url}/api/model-library/releases'
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                        url, headers=self._ml_hub_headers()) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f'HTTP {resp.status}')
+                    data = await resp.json()
+        except Exception as e:
+            await ws.send_json({
+                'type': 'cloud_models',
+                'success': False,
+                'hub_url': self.ml_hub_url,
+                'message': f'ml-hub unreachable: {e}',
+            })
+            return
+
+        models = []
+        for rel in data.get('releases', []):
+            formats = {}
+            for fmt, info in (rel.get('formats') or {}).items():
+                if isinstance(info, dict) and info.get('available'):
+                    formats[fmt] = {'size_bytes': info.get('size_bytes')}
+            labels = (rel.get('class_schema') or {}).get('labels') or []
+            models.append({
+                'release_id': rel.get('release_id', ''),
+                'display_name': (rel.get('display_name')
+                                 or rel.get('release_id', '')),
+                'task': rel.get('task', ''),
+                'status': rel.get('status', ''),
+                'formats': formats,
+                'metrics': rel.get('metrics') or {},
+                'classes': [l.get('name', '') for l in labels],
+                'imgsz': (rel.get('runtime') or {}).get('imgsz'),
+                'updated_at': rel.get('updated_at', ''),
+            })
+        await ws.send_json({
+            'type': 'cloud_models',
+            'success': True,
+            'hub_url': self.ml_hub_url,
+            'models': models,
+        })
+
+    async def _handle_download_model(self, ws, msg: Dict):
+        """Download a release artifact from ml-hub into the models dir.
+
+        ml-hub delivers format=pt as a raw .pt file; every other format
+        arrives as a zip archive that we extract client-side.
+        """
+        release_id = msg.get('release_id', '')
+        fmt = msg.get('format', 'pt')
+
+        async def fail(message: str):
+            await ws.send_json({
+                'type': 'download_model_result',
+                'success': False,
+                'release_id': release_id,
+                'format': fmt,
+                'message': message,
+            })
+
+        if not release_id:
+            await fail('release_id required')
+            return
+        if not self.models_dir:
+            await fail('models directory not found (set models_dir parameter)')
+            return
+
+        subdir = MODEL_FORMAT_DIRS.get(fmt, fmt)
+        dest_dir = os.path.join(self.models_dir, subdir)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        quoted = urllib.parse.quote(release_id, safe='')
+        url = (f'{self.ml_hub_url}/api/model-library/releases/'
+               f'{quoted}/download?format={urllib.parse.quote(fmt)}')
+        self.get_logger().info(f'Downloading model: {url}')
+
+        tmp_path = ''
+        try:
+            timeout = aiohttp.ClientTimeout(total=3600, sock_read=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                        url, headers=self._ml_hub_headers()) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:300]
+                        raise RuntimeError(f'HTTP {resp.status}: {body}')
+
+                    filename = ''
+                    cd = resp.headers.get('Content-Disposition', '')
+                    m = re.search(r'filename="?([^";]+)"?', cd)
+                    if m:
+                        filename = os.path.basename(m.group(1))
+                    if not filename:
+                        ext = 'pt' if fmt == 'pt' else 'zip'
+                        filename = f'{safe_model_dirname(release_id)}.{ext}'
+
+                    total = int(resp.headers.get('Content-Length') or 0)
+                    received = 0
+                    fd, tmp_path = tempfile.mkstemp(
+                        dir=dest_dir, suffix='.part')
+                    with os.fdopen(fd, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(1 << 20):
+                            f.write(chunk)
+                            received += len(chunk)
+                            await ws.send_json({
+                                'type': 'download_progress',
+                                'release_id': release_id,
+                                'format': fmt,
+                                'received': received,
+                                'total': total,
+                            })
+
+            if fmt == 'pt':
+                final_path = os.path.join(dest_dir, filename)
+                os.replace(tmp_path, final_path)
+            else:
+                extract_dir = os.path.join(
+                    dest_dir, safe_model_dirname(release_id))
+                final_path = extract_model_zip(tmp_path, extract_dir)
+                os.remove(tmp_path)
+            tmp_path = ''
+        except Exception as e:
+            if tmp_path and os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+            self.get_logger().error(f'Model download failed: {e}')
+            await fail(str(e))
+            return
+
+        self.get_logger().info(f'Model downloaded: {final_path}')
+        await ws.send_json({
+            'type': 'download_model_result',
+            'success': True,
+            'release_id': release_id,
+            'format': fmt,
+            'path': final_path,
+            'name': os.path.relpath(final_path, self.models_dir),
+        })
+
+    # -----------------------------------------------------------------------
     # Node launch / stop
     # -----------------------------------------------------------------------
     async def _handle_launch_node(self, ws, msg: Dict):
@@ -893,7 +1150,10 @@ class FVPipelineEditorNode(Node):
         self._kill_process(node_id)
 
         # Kill orphaned processes from previous editor sessions
-        self._kill_orphaned(executable)
+        # (kill_orphans_on_launch=false のスタックでは無効 — pgrep -f は
+        # エディタ外で常駐する同名ノードまで巻き添えにするため)
+        if self.kill_orphans:
+            self._kill_orphaned(executable)
 
         # Build ros2 run command
         cmd = ['ros2', 'run', package, executable, '--ros-args']
@@ -918,9 +1178,10 @@ class FVPipelineEditorNode(Node):
             f'Launching [{node_id}]: {" ".join(cmd[:8])}...')
 
         try:
-            # Use CycloneDDS to avoid FastRTPS symbol collision with librealsense2
+            # child_rmw_implementation='' -> 親環境を継承 (パラメータ解説参照)
             launch_env = os.environ.copy()
-            launch_env['RMW_IMPLEMENTATION'] = 'rmw_cyclonedds_cpp'
+            if self.child_rmw:
+                launch_env['RMW_IMPLEMENTATION'] = self.child_rmw
 
             proc = subprocess.Popen(
                 cmd,
@@ -931,6 +1192,23 @@ class FVPipelineEditorNode(Node):
             )
             with self._process_lock:
                 self._processes[node_id] = proc
+            # stderr は常時ドレインする (ROSログはstderr行き)。読み手なしの
+            # PIPE は 64KB で詰まり、trtexec ビルドのような饒舌な子を
+            # ブロックさせる (実測しかけた 2026-07-18)。末尾だけ保持して
+            # クラッシュ時の診断に使う。
+            tail: list = []
+            self._stderr_tails[node_id] = tail
+
+            def _drain(p=proc, t=tail):
+                try:
+                    for line in iter(p.stderr.readline, b''):
+                        t.append(line.decode('utf-8', errors='replace'))
+                        if len(t) > 50:
+                            del t[:len(t) - 50]
+                except Exception:
+                    pass
+            threading.Thread(target=_drain, daemon=True,
+                             name=f'stderr-{node_id}').start()
 
             await ws.send_json({
                 'type': 'launch_result',
@@ -1359,11 +1637,10 @@ class FVPipelineEditorNode(Node):
                     status = 'stopped' if poll == 0 else 'error'
                     stderr_output = ''
                     if poll != 0:
-                        try:
-                            stderr_output = proc.stderr.read().decode(
-                                'utf-8', errors='replace')[-500:]
-                        except Exception:
-                            pass
+                        # ドレインスレッドが貯めた末尾 (直接 read すると
+                        # ドレインと競合するのでこちらを使う)
+                        tail = self._stderr_tails.get(node_id, [])
+                        stderr_output = ''.join(tail)[-500:]
                         self.get_logger().warn(
                             f'Node [{node_id}] crashed (exit={poll}): '
                             f'{stderr_output}')

@@ -21,6 +21,8 @@
 #include <rclcpp/qos.hpp>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 /**
@@ -50,8 +52,11 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
         // ===== Step 2: RealSenseの初期化（shared_from_thisより前） =====
         RCLCPP_INFO(this->get_logger(), "📷 Step 2: Initializing RealSense...");
         if (!initializeRealSense()) {
-            RCLCPP_ERROR(this->get_logger(), "❌ Failed to initialize RealSense");
-            return;
+            // Fail closed: a node without a camera used to stay alive as a
+            // silent zombie (topics never appear, watchdog never runs).
+            // Exit instead so the launch respawn keeps retrying until the
+            // camera enumerates.
+            exitForSupervisedRestart("RealSense initialization failed (camera not enumerated?)");
         }
         
         // ===== Step 3: パブリッシャーの初期化（RealSenseの後） =====
@@ -697,89 +702,23 @@ bool FVDepthCameraNode::startSensors() {
     return true;
 }
 
-bool FVDepthCameraNode::deepResetAndRestart() {
-    // Step 1: tear down sensors against the (now-likely-invalid) device.
-    // stopSensors() already swallows rs2::error internally so it's safe
-    // to call after USB unplug.
-    stopSensors();
-
-    // Step 1b: explicitly drop EVERY cached rs2 handle that still
-    // references the about-to-be-destroyed context. Anything left
-    // referencing the old context (sensor, device, stream_profile,
-    // frame, queued frame items) will be freed against an arena that
-    // no longer exists once ctx_.reset() runs, producing
-    // "free(): corrupted unsorted chunks" on the *next* deep reset
-    // (the first one looks fine because the dangling pointers
-    // haven't been touched yet).
-    try { color_sensor_ = rs2::sensor(); } catch (...) {}
-    try { depth_sensor_ = rs2::sensor(); } catch (...) {}
-    try { device_ = rs2::device(); } catch (...) {}
-    try { color_profile_ = rs2::stream_profile(); } catch (...) {}
-    try { depth_profile_ = rs2::stream_profile(); } catch (...) {}
-    {
-        std::lock_guard<std::mutex> lk(latest_frame_mutex_);
-        try { latest_color_frame_ = rs2::frame(); } catch (...) {}
-        try { latest_depth_frame_ = rs2::frame(); } catch (...) {}
-    }
-    {
-        std::lock_guard<std::mutex> lk(sync_mutex_);
-        // FrameItem holds rs2::frame; clear queues to drop refs.
-        color_queue_.clear();
-        depth_queue_.clear();
-    }
-
-    // Step 2: drop the old rs2::context. rs2::device handles cached
-    // inside it survive USB enumeration but point at the pre-unplug
-    // device path; that's exactly the "No such device" the cheap
-    // stop+start watchdog kept hitting.
-    try {
-        ctx_.reset();
-    } catch (...) {}
-
-    // Step 3: recreate context + re-enumerate. selectCamera() walks
-    // ctx_->query_devices() and reassigns device_ to a fresh handle.
-    // We retry up to ~3s because USB re-enumeration after plug-in is
-    // not instantaneous on Tegra.
-    constexpr int kMaxAttempts = 6;
-    constexpr int kAttemptDelayMs = 500;
-    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-        try {
-            ctx_ = std::make_unique<rs2::context>();
-            if (selectCamera()) {
-                if (startSensors()) {
-                    RCLCPP_INFO(this->get_logger(),
-                                "✅ Deep reset succeeded on attempt %d/%d",
-                                attempt, kMaxAttempts);
-                    return true;
-                }
-                RCLCPP_WARN(this->get_logger(),
-                            "Deep reset attempt %d/%d: startSensors failed",
-                            attempt, kMaxAttempts);
-            } else {
-                RCLCPP_WARN(this->get_logger(),
-                            "Deep reset attempt %d/%d: no device enumerated",
-                            attempt, kMaxAttempts);
-            }
-        } catch (const rs2::error &e) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Deep reset attempt %d/%d: %s",
-                        attempt, kMaxAttempts, e.what());
-        } catch (const std::exception &e) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Deep reset attempt %d/%d: %s",
-                        attempt, kMaxAttempts, e.what());
-        }
-        if (attempt < kMaxAttempts) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kAttemptDelayMs));
-        }
-    }
-    RCLCPP_ERROR(this->get_logger(),
-                 "❌ Deep reset exhausted %d attempts; sensor stays down "
-                 "until next watchdog cycle (operator may need to "
-                 "verify USB cable / power).",
-                 kMaxAttempts);
-    return false;
+void FVDepthCameraNode::exitForSupervisedRestart(const std::string& reason) {
+    // In-process recovery (the former deepResetAndRestart) is not safe:
+    // when the USB device is wedged, sensor.stop()/close() can fail and
+    // leave librealsense driver threads alive, and destroying the
+    // rs2::context afterwards corrupts the heap — observed repeatedly as
+    // "free(): corrupted unsorted chunks" → SIGABRT, killing the node
+    // with no recovery at all. Even when such a reset "succeeds", the
+    // heap can no longer be trusted. The only reliable reset is a fresh
+    // process, so exit immediately — no destructors, no rs2 teardown
+    // (the kernel releases the USB fds) — and let the launch respawn
+    // reopen the camera cleanly.
+    RCLCPP_FATAL(this->get_logger(),
+                 "🔁 %s — exiting so the launch respawn can restart the node cleanly",
+                 reason.c_str());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(3);
 }
 
 void FVDepthCameraNode::stopSensors() {
@@ -876,10 +815,9 @@ bool FVDepthCameraNode::selectCamera()
 
     // Crash guard: every branch below dereferences `devices` (most
     // notoriously the auto branch's `devices[0]`, which segfaults on
-    // an empty vector). This used to be reachable only at boot when
-    // ros2 launch already verified a device existed; the watchdog
-    // deep-reset now calls selectCamera() while the USB might still
-    // be unplugged, so we have to fail closed before any indexing.
+    // an empty vector). After a respawn the node can come up while the
+    // USB device is still re-enumerating, so fail closed before any
+    // indexing; the caller exits and the respawn retries.
     if (devices.empty()) {
         RCLCPP_WARN(this->get_logger(),
                     "🔍 selectCamera(): no RealSense devices enumerated; "
@@ -1119,6 +1057,12 @@ void FVDepthCameraNode::processingLoop()
     int depth_pub_count = 0;
     auto last_log_time = std::chrono::steady_clock::now();
     bool warned = false;
+    bool warned_depth = false;
+    // Baseline for the depth watchdog when no depth frame has arrived at
+    // all (e.g. the sensor opened color-only after a respawn).
+    const int64_t loop_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
     
     while (running_ && rclcpp::ok()) {
         try {
@@ -1161,13 +1105,8 @@ void FVDepthCameraNode::processingLoop()
                                 warned = true;
                             }
                             if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                RCLCPP_ERROR(this->get_logger(), "🔁 Deep reset after %ldms color stall (mode=1)", (long)stall_ms);
-                                deepResetAndRestart();
-                                last_color_recv_ns_.store(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                                    std::memory_order_relaxed);
-                                warned = false;
+                                exitForSupervisedRestart(
+                                    std::to_string((long)stall_ms) + "ms color stall (mode=1)");
                             }
                         }
                         break;
@@ -1227,6 +1166,33 @@ void FVDepthCameraNode::processingLoop()
                         }
                     }
 
+                    // Depth-only stall watchdog. The color-keyed check below
+                    // never runs while color frames keep arriving, so a depth
+                    // stream dying alone (observed in production as a partial
+                    // USB failure: color stayed at 30Hz, depth silent for
+                    // 45min) previously went undetected forever. Same
+                    // exit+respawn recovery, same thresholds.
+                    if (got_depth) {
+                        warned_depth = false;
+                    } else if (got_color && stream_config_.depth_enabled && stall_restart_ms_ > 0) {
+                        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                   .count();
+                        const int64_t last_d_ns = last_depth_recv_ns_.load(std::memory_order_relaxed);
+                        const int64_t base_ns = (last_d_ns > 0) ? last_d_ns : loop_start_ns;
+                        const int64_t d_stall_ms = (now_ns - base_ns) / 1000000;
+                        if (stall_warn_ms_ > 0 && d_stall_ms >= stall_warn_ms_ && !warned_depth) {
+                            RCLCPP_WARN(this->get_logger(),
+                                        "⚠️ No depth frames for %ldms while color continues (mode=2)",
+                                        (long)d_stall_ms);
+                            warned_depth = true;
+                        }
+                        if (d_stall_ms >= stall_restart_ms_) {
+                            exitForSupervisedRestart(
+                                std::to_string((long)d_stall_ms) + "ms depth stall (mode=2, color still alive)");
+                        }
+                    }
+
                     if (!got_color && !got_depth) {
                         const int64_t last_ns = last_color_recv_ns_.load(std::memory_order_relaxed);
                         if (last_ns > 0) {
@@ -1244,13 +1210,8 @@ void FVDepthCameraNode::processingLoop()
                                 warned = true;
                             }
                             if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                RCLCPP_ERROR(this->get_logger(), "🔁 Deep reset after %ldms color stall (mode=2)", (long)stall_ms);
-                                deepResetAndRestart();
-                                last_color_recv_ns_.store(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                                    std::memory_order_relaxed);
-                                warned = false;
+                                exitForSupervisedRestart(
+                                    std::to_string((long)stall_ms) + "ms color stall (mode=2)");
                             }
                         }
                         break;
@@ -1351,8 +1312,17 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
     // librealsense and prevents downstream tf2 future-extrapolation
     // failures.
     if (drift_resync_ms_ >= 0.0) {
-        const rclcpp::Duration drift = stamp - now;
-        const int64_t drift_ns = std::abs(drift.nanoseconds());
+        // Compare via nanoseconds() (plain int64 wall-clock counts) rather
+        // than rclcpp::Time/Duration operator- : `stamp` (from
+        // base_ros_stamp_), `now` (this->now()) and the throttle baseline
+        // can carry different clock sources (RCL_ROS_TIME vs
+        // RCL_SYSTEM_TIME). rclcpp::Time::operator-/< throw
+        // "can't subtract times with different time sources [1 != 2]"
+        // (std::runtime_error → SIGABRT) on a clock-type mismatch. That
+        // fired on the re-anchor path below (now - s_last_log) whenever the
+        // drift exceeded threshold — e.g. after a host clock jump on reboot —
+        // killing the D405 node. nanoseconds() never throws.
+        const int64_t drift_ns = std::abs(stamp.nanoseconds() - now.nanoseconds());
         const int64_t threshold_ns =
             static_cast<int64_t>(drift_resync_ms_ * 1e6);
         if (drift_ns > threshold_ns) {
@@ -1362,14 +1332,14 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
             last_device_ts_ms_ = device_ts_ms;
             last_ros_stamp_ = now;
             // Surface the event at most once per 10 s to avoid log spam.
-            static rclcpp::Time s_last_log{0, 0, RCL_SYSTEM_TIME};
-            if ((now - s_last_log).nanoseconds() > static_cast<int64_t>(1e10)) {
-                s_last_log = now;
+            static int64_t s_last_log_ns = 0;
+            if ((now.nanoseconds() - s_last_log_ns) > static_cast<int64_t>(1e10)) {
+                s_last_log_ns = now.nanoseconds();
                 RCLCPP_INFO(
                     this->get_logger(),
                     "device->ROS time mapping re-anchored "
                     "(drift was %.3f s; threshold %.3f s)",
-                    drift.seconds(), drift_resync_ms_ / 1000.0);
+                    static_cast<double>(drift_ns) / 1e9, drift_resync_ms_ / 1000.0);
             }
             return stamp;
         }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <fv_msgs/msg/detection_array.hpp>
 #include <opencv2/core.hpp>
@@ -24,6 +25,10 @@ class InstanceSegNode : public rclcpp::Node {
  private:
   struct TrackState {
     int id = 0;
+    // Per-frame slot in the published ~/mask_id MONO8 image.
+    // Detection2D.mask_instance_id must carry this same value.
+    // Stable tracking ID stays in TrackState::id.
+    uint8_t publish_slot_id = 0;
     cv::Rect bbox;
     cv::Mat mask;
     float score = 0.f;
@@ -42,6 +47,16 @@ class InstanceSegNode : public rclcpp::Node {
   void publishMask(const cv::Mat& mask_mono, const std_msgs::msg::Header& header);
   void publishDetections(const std::vector<TrackState>& tracks, const std_msgs::msg::Header& header);
   void updateTracking(const InferResult& res, const rclcpp::Time& stamp);
+  bool loadModel(const std::string& backend,
+                 const std::string& model_path,
+                 const std::string& device,
+                 const std::string& fallback_device,
+                 bool nms_class_agnostic,
+                 int max_detections,
+                 bool debug_shapes,
+                 int infer_timeout_ms);
+  rcl_interfaces::msg::SetParametersResult onParametersSet(
+      const std::vector<rclcpp::Parameter>& parameters);
 
   cv::Scalar nextColor();
   void updateStats(double inference_ms, double total_ms, std::size_t detection_count);
@@ -61,12 +76,34 @@ class InstanceSegNode : public rclcpp::Node {
   rclcpp::Publisher<fv_msgs::msg::DetectionArray>::SharedPtr fv_dets_pub_;
 
   std::unique_ptr<Inferencer> inferencer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
+  std::mutex inferencer_mutex_;
 
   std::string backend_;
   std::string model_path_;
   std::string device_;
   std::string fallback_device_;
   std::string input_image_topic_;
+  // Class index -> name. The TRT .engine carries no names metadata (the .onnx
+  // does, but trtexec drops it), so the operator supplies them via the
+  // `class_names` param (profile / settings UI). Empty -> label left blank.
+  std::vector<std::string> class_names_;
+  std::string labelForClass(int cls) const {
+    return (cls >= 0 && cls < static_cast<int>(class_names_.size()))
+               ? class_names_[cls]
+               : std::string();
+  }
+  // Read `<model_path stem>.names` (one class per line) next to the model.
+  // Empty vector when the sidecar is absent/empty (caller keeps its fallback).
+  std::vector<std::string> loadNamesSidecar(const std::string& model_path) const;
+  // Post-inference false-detection filter. All thresholds default to 0
+  // (disabled) so the filter is opt-in via params / the settings UI.
+  double min_box_area_px_ = 0.0;
+  double max_box_area_px_ = 0.0;
+  double min_aspect_ = 0.0;     // w/h lower bound
+  double max_aspect_ = 0.0;     // w/h upper bound
+  double min_mask_fill_ = 0.0;  // countNonZero(mask within bbox) / bbox.area()
+  void filterDetections(InferResult& res) const;
   double conf_thres_;
   double iou_thres_;
   bool publish_detections_;
@@ -74,12 +111,21 @@ class InstanceSegNode : public rclcpp::Node {
   bool nms_class_agnostic_ = true;
   int max_detections_ = 100;
   bool debug_shapes_ = false;
+  int infer_timeout_ms_ = 0;
 
   std::vector<TrackState> tracks_;
   int next_track_id_ = 1;
   int hold_frames_ = 3;
   int drop_frames_ = 10;
   double match_distance_px_ = 80.0;
+  // Hysteresis: a detection may only CREATE a track at >= this score;
+  // matching an existing track works all the way down to conf_thres.
+  // 0.0 disables (every detection can start a track, pre-hysteresis
+  // behaviour). Profiles run conf_thres very low on purpose (0.01-0.06)
+  // so held objects survive confidence dips - without an entry gate
+  // that same low floor let every noise blob birth a track and the
+  // overlay flickered with one-frame boxes.
+  double track_enter_conf_ = 0.0;
   std::vector<cv::Scalar> palette_;
   std::size_t palette_index_ = 0;
 

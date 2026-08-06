@@ -1,0 +1,58 @@
+/**:
+  ros__parameters:
+    color_topic: "/d405_color/image_raw"
+    depth_topic: "/d405_depth/image_rect_raw"
+    camera_info_topic: "/d405_depth/camera_info"
+
+    refined_depth_topic: "/d405_depth_refined/image_rect_raw"
+    mask_topic: "/d405_depth_refined/mask"
+    # Disabled: clouds are built from the refined depth by the pointcloud
+    # node / 3D detectors; an advertised-but-silent topic here only
+    # confuses topic listings and viewers.
+    pointcloud_topic: ""
+    frame_id_override: ""
+
+    # LingBot deps live in the lingbot-depth-worker container, not in the
+    # vlabor backend env (torch is present but mdm/model weights are not).
+    backend: "http"
+    worker_endpoint: "http://127.0.0.1:5540/infer"
+    worker_timeout_sec: 5.0
+    model_id: "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
+    local_model_path: ""
+    device: "auto"
+    use_fp16: true
+    apply_mask: true
+    # Thor, PyTorch backend: L0 ≈ 100ms infer (~3Hz end-to-end) but soft
+    # object edges (1200-token grid). L9 ≈ 370ms (~1.5Hz) with the
+    # sharpest edges the model can produce. Pick by use: cube-edge
+    # quality favours 9, update rate favours 0.
+    resolution_level: 9
+    # No silent passthrough: when the worker is down the refined topics go
+    # quiet instead of republishing raw depth as if it were refined.
+    # Consumers keep reading the raw /d405_depth topics directly.
+    fallback_passthrough: false
+
+    # D405 publishes 16UC1 in 0.1mm units (D405 default depth unit; the
+    # profile's depth_normals_depth_scale is 0.0001 for the same reason).
+    # This scale is used for input decode AND output encode, so refined
+    # output stays in the same 0.1mm units as the raw sensor stream.
+    depth_scale_16uc1: 0.0001
+    # 16UC1 = same size/encoding as raw sensor depth (drop-in compatible;
+    # 32FC1's 1.2MB fragmented messages starve BEST_EFFORT subscribers on
+    # busy nodes like the dashboard).
+    output_encoding: "16UC1"
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+    point_stride: 2
+
+    sync_queue_size: 10
+    sync_slop_sec: 0.03
+    qos_reliability: "best_effort"
+    log_every_n_frames: 30
+
+    # Only run inference while the dashboard's depth tile actually selects
+    # the lingbot stream. Before this gate the worker refined every frame
+    # around the clock (~90-370ms GPU each) even with the tile on "raw" -
+    # the raw/lingbot toggle only switched what consumers read, so the GPU
+    # never got lighter. Model stays loaded; switching back is instant.
+    depth_source_topic: "/vlabor/d405_depth_source"

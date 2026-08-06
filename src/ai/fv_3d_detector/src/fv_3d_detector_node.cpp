@@ -14,10 +14,13 @@
 #include <pcl/segmentation/extract_clusters.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <atomic>
 #include <mutex>
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "fv_msgs/msg/detection_array.hpp"
 #include "fv_msgs/msg/object3_d.hpp"
@@ -72,6 +75,13 @@ public:
         this->declare_parameter<std::string>("mask_topic", "/d405_cube/mask");
         this->declare_parameter<std::string>("detections_topic", "/d405_cube/detections");
         this->declare_parameter<std::string>("depth_topic", "/d405_depth/filtered");
+        // Optional switchable secondary depth source (e.g. LingBot refined
+        // depth). Both stay subscribed; depth_source_topic
+        // (std_msgs/String, transient_local) selects the active one:
+        // "default"/"raw" = depth_topic, anything else = alt. The alt sub
+        // is RELIABLE: large fragmented Images starve BEST_EFFORT delivery.
+        this->declare_parameter<std::string>("alt_depth_topic", "");
+        this->declare_parameter<std::string>("depth_source_topic", "");
         this->declare_parameter<std::string>("color_topic", "/d405_color/image_raw");
         this->declare_parameter<std::string>("camera_info_topic", "/d405_depth/camera_info");
         this->declare_parameter<std::string>("output_topic", "~/objects_3d");
@@ -79,6 +89,13 @@ public:
         this->declare_parameter<std::string>("marker_topic", "~/markers");
         this->declare_parameter<bool>("publish_overlay", true);
         this->declare_parameter<int>("min_points", 10);
+        // Depth-dropout hold: when a live 2D track fails 3D extraction
+        // (typically stereo depth holes on low-texture faces - red cubes
+        // are the worst case), reuse its last successful OBB for up to
+        // this many seconds instead of dropping the object for the frame.
+        // Bounded, gated on the 2D track still existing, and logged.
+        // 0 = off.
+        this->declare_parameter<double>("depth_hold_sec", 0.0);
         this->declare_parameter<int>("mask.erode_px", 0);
         this->declare_parameter<double>("depth_scale", 0.001);
         // Distance filter
@@ -144,7 +161,31 @@ public:
             std::bind(&Detector3DNode::onCameraInfo, this, std::placeholders::_1));
         depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             depth_topic_, qos_be,
-            std::bind(&Detector3DNode::onDepth, this, std::placeholders::_1));
+            [this](const sensor_msgs::msg::Image::SharedPtr m) {
+                if (use_alt_depth_.load()) return;
+                onDepth(m);
+            });
+        if (!alt_depth_topic_.empty()) {
+            depth_alt_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+                alt_depth_topic_, rclcpp::QoS(1).reliable(),
+                [this](const sensor_msgs::msg::Image::SharedPtr m) {
+                    if (!use_alt_depth_.load()) return;
+                    onDepth(m);
+                });
+            if (!depth_source_topic_.empty()) {
+                depth_source_sub_ = this->create_subscription<std_msgs::msg::String>(
+                    depth_source_topic_,
+                    rclcpp::QoS(1).reliable().transient_local(),
+                    [this](std_msgs::msg::String::ConstSharedPtr m) {
+                        const bool alt = (m->data != "default" && m->data != "raw");
+                        if (alt != use_alt_depth_.load()) {
+                            use_alt_depth_.store(alt);
+                            RCLCPP_INFO(this->get_logger(), "depth source -> %s",
+                                        alt ? alt_depth_topic_.c_str() : depth_topic_.c_str());
+                        }
+                    });
+            }
+        }
         color_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             color_topic_, qos_be,
             std::bind(&Detector3DNode::onColor, this, std::placeholders::_1));
@@ -176,6 +217,8 @@ private:
         mask_topic_        = this->get_parameter("mask_topic").as_string();
         det_topic_         = this->get_parameter("detections_topic").as_string();
         depth_topic_       = this->get_parameter("depth_topic").as_string();
+        alt_depth_topic_   = this->get_parameter("alt_depth_topic").as_string();
+        depth_source_topic_ = this->get_parameter("depth_source_topic").as_string();
         color_topic_       = this->get_parameter("color_topic").as_string();
         camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
         output_topic_      = this->get_parameter("output_topic").as_string();
@@ -183,6 +226,7 @@ private:
         marker_topic_      = this->get_parameter("marker_topic").as_string();
         publish_overlay_   = this->get_parameter("publish_overlay").as_bool();
         min_points_        = std::max(3, static_cast<int>(this->get_parameter("min_points").as_int()));
+        depth_hold_sec_    = std::max(0.0, this->get_parameter("depth_hold_sec").as_double());
         mask_erode_px_     = std::max(0, static_cast<int>(this->get_parameter("mask.erode_px").as_int()));
         depth_scale_       = this->get_parameter("depth_scale").as_double();
         min_depth_m_       = static_cast<float>(this->get_parameter("min_depth_m").as_double());
@@ -224,13 +268,22 @@ private:
         last_det_ = msg;
     }
 
-    bool passFilters(float distance_m, float max_extent, float min_extent) const {
+    bool passFilters(float distance_m, float max_extent, float mid_extent) const {
         if (filter_min_dist_ > 0.0f && distance_m < filter_min_dist_) return false;
         if (filter_max_dist_ > 0.0f && distance_m > filter_max_dist_) return false;
         if (filter_min_size_ > 0.0f && max_extent < filter_min_size_) return false;
         if (filter_max_size_ > 0.0f && max_extent > filter_max_size_) return false;
-        if (filter_max_aspect_ > 0.0f && min_extent > 1e-4f &&
-            (max_extent / min_extent) > filter_max_aspect_) return false;
+        // Aspect is judged on the two LARGEST extents (the visible face),
+        // not max/min: a cube seen face-on by the wrist camera images as a
+        // ~40x30x3mm slab (only its front face has depth), so a max/min
+        // ratio compares face width against viewing-angle-dependent
+        // thickness and strobes with depth noise (white cube measured
+        // 39/26/3mm -> ratio 13, rejected every frame; it only passed when
+        // depth noise happened to thicken the slab). Sliver ghosts are
+        // still rejected: a thin line has a tiny mid extent, and oversized
+        // background bleed is caught by filter.max_size_m above.
+        if (filter_max_aspect_ > 0.0f && mid_extent > 1e-4f &&
+            (max_extent / mid_extent) > filter_max_aspect_) return false;
         return true;
     }
 
@@ -340,6 +393,13 @@ private:
             int y_max = std::min(static_cast<int>(mask_h) - 1, static_cast<int>(det.bbox_max.y));
             if (x_min >= x_max || y_min >= y_max) continue;
             const uint32_t mask_instance_id = det.mask_instance_id;
+            if (mask_instance_id > 255) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000,
+                    "Detection2D.mask_instance_id=%u cannot match MONO8 mask topic %s; producer must publish a per-frame 1..255 mask slot, with stable track id in Detection2D.id",
+                    mask_instance_id, mask_topic_.c_str());
+                continue;
+            }
 
             CloudPtr sub(new Cloud);
             sub->points.reserve(static_cast<size_t>((x_max - x_min) * (y_max - y_min) / 4));
@@ -385,14 +445,24 @@ private:
             }
 
             sub->width = sub->points.size(); sub->height = 1; sub->is_dense = false;
-            if (static_cast<int>(sub->points.size()) < min_points_) continue;
+            const size_t raw_pts = sub->points.size();
+            if (static_cast<int>(raw_pts) < min_points_) {
+                noteExtractFail(det, "raw_pts", raw_pts, 0, 0, 0, 0);
+                continue;
+            }
             sub = filterByMedianDepth(sub);
             sub = filterStatisticalOutliers(sub);
             sub = keepLargestCluster(sub);
-            if (static_cast<int>(sub->points.size()) < min_points_) continue;
+            if (static_cast<int>(sub->points.size()) < min_points_) {
+                noteExtractFail(det, "filtered_pts", raw_pts, sub->points.size(), 0, 0, 0);
+                continue;
+            }
 
             auto obb = fluent_cloud::compute_obb_metrics(sub);
-            if (obb.num_points < static_cast<uint32_t>(min_points_)) continue;
+            if (obb.num_points < static_cast<uint32_t>(min_points_)) {
+                noteExtractFail(det, "obb_pts", raw_pts, sub->points.size(), 0, 0, 0);
+                continue;
+            }
 
             float distance = obb.center.norm();
             float ex = 2.0f * obb.extents[0];
@@ -400,8 +470,13 @@ private:
             float ez = 2.0f * obb.extents[2];
             float max_extent = std::max({ex, ey, ez});
             float min_extent = std::min({ex, ey, ez});
+            float mid_extent = ex + ey + ez - max_extent - min_extent;
 
-            if (!passFilters(distance, max_extent, min_extent)) continue;
+            if (!passFilters(distance, max_extent, mid_extent)) {
+                noteExtractFail(det, "size_filters", raw_pts, sub->points.size(),
+                                ex, ey, ez);
+                continue;
+            }
 
             Candidate c;
             c.det_id = det_id;
@@ -411,6 +486,52 @@ private:
             c.distance = distance;
             c.x_min = x_min; c.y_min = y_min; c.x_max = x_max; c.y_max = y_max;
             cands.push_back(std::move(c));
+        }
+
+        // ---- Phase 1.5: depth-dropout hold ----
+        // Refresh the per-track OBB cache from this frame's successes,
+        // then re-emit the cached OBB for tracks whose 2D detection is
+        // still live but whose depth extraction failed this frame.
+        if (depth_hold_sec_ > 0.0) {
+            const rclcpp::Time now = this->get_clock()->now();
+            std::unordered_set<int32_t> produced;
+            produced.reserve(cands.size());
+            for (const auto &c : cands) {
+                produced.insert(c.det_id);
+                auto &h = hold_cache_[c.det_id];
+                h.sub = c.sub;
+                h.obb = c.obb;
+                h.distance = c.distance;
+                h.x_min = c.x_min; h.y_min = c.y_min;
+                h.x_max = c.x_max; h.y_max = c.y_max;
+                h.last_ok = now;
+            }
+            for (auto it = hold_cache_.begin(); it != hold_cache_.end();) {
+                if ((now - it->second.last_ok).seconds() > depth_hold_sec_) {
+                    it = hold_cache_.erase(it);
+                    continue;
+                }
+                const int32_t det_id = it->first;
+                auto dit = det_map.find(det_id);
+                if (dit != det_map.end() && produced.count(det_id) == 0) {
+                    const auto &h = it->second;
+                    Candidate c;
+                    c.det_id = det_id;
+                    c.det = dit->second;  // fresh label/conf from the live 2D track
+                    c.sub = h.sub;
+                    c.obb = h.obb;
+                    c.distance = h.distance;
+                    c.x_min = h.x_min; c.y_min = h.y_min;
+                    c.x_max = h.x_max; c.y_max = h.y_max;
+                    cands.push_back(std::move(c));
+                    RCLCPP_INFO_THROTTLE(
+                        get_logger(), *get_clock(), 5000,
+                        "depth hold: track %d (%s) kept from OBB %.2fs old (depth extraction failed this frame)",
+                        det_id, dit->second.label.c_str(),
+                        (now - h.last_ok).seconds());
+                }
+                ++it;
+            }
         }
 
         // ---- Phase 2: 3D NMS with class-id rescue ----
@@ -837,9 +958,44 @@ private:
     }
 
     std::string mask_topic_, det_topic_, depth_topic_, color_topic_;
+    std::string alt_depth_topic_, depth_source_topic_;
+    std::atomic<bool> use_alt_depth_{false};
     std::string camera_info_topic_, output_topic_, marker_topic_;
     bool publish_markers_{true}, publish_overlay_{true};
     int min_points_{10};
+
+    // Per-track extraction-failure diagnostics: one INFO line per track
+    // every 3s at most, naming the stage that rejected it and the numbers
+    // the filters saw. Perception drops must stay observable - a silent
+    // reject here read as "camera is broken" from the dashboard.
+    void noteExtractFail(const fv_msgs::msg::Detection2D &det,
+                         const char *stage, size_t raw_pts, size_t kept_pts,
+                         float ex, float ey, float ez) {
+        const auto now = this->get_clock()->now();
+        auto &last = fail_log_last_[det.id];
+        if (last.nanoseconds() != 0 && (now - last).seconds() < 3.0) {
+            return;
+        }
+        last = now;
+        RCLCPP_INFO(get_logger(),
+            "3d extract fail: id=%d label=%s stage=%s raw_pts=%zu kept_pts=%zu "
+            "extent=%.3f/%.3f/%.3f",
+            det.id, det.label.c_str(), stage, raw_pts, kept_pts, ex, ey, ez);
+    }
+    std::unordered_map<int32_t, rclcpp::Time> fail_log_last_;
+
+    // Depth-dropout hold (see depth_hold_sec param). Keyed by the stable
+    // Detection2D.id; entries expire depth_hold_sec_ after their last
+    // successful extraction.
+    struct HeldObb {
+        CloudPtr sub;
+        fluent_cloud::OBBMetrics obb;
+        float distance{0.0f};
+        int x_min{0}, y_min{0}, x_max{0}, y_max{0};
+        rclcpp::Time last_ok;
+    };
+    double depth_hold_sec_{0.0};
+    std::unordered_map<int32_t, HeldObb> hold_cache_;
     int mask_erode_px_{0};
     double depth_scale_{0.001};
     float min_depth_m_{0.05f}, max_depth_m_{3.0f};
@@ -874,6 +1030,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr info_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_, color_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_alt_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr depth_source_sub_;
 
     rclcpp::Publisher<fv_msgs::msg::Object3DArray>::SharedPtr obj_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_out_pub_;
