@@ -64,7 +64,8 @@ class ActiveLock:
         # If the pid is alive AND uuid matches a different instance, the previous
         # recorder is still running (we should not start). If uuid matches ours,
         # this is a stale lock from our own bad shutdown path.
-        if pid and _pid_alive(pid) and payload.get("recorder_uuid") != self.recorder_uuid:
+        if (pid and _recorder_pid_alive(pid)
+                and payload.get("recorder_uuid") != self.recorder_uuid):
             LOG.error("another recorder appears alive (pid=%s); refusing to start", pid)
             return {**payload, "status": "another_alive"}
         LOG.warning("orphan lock detected: episode_id=%s pid=%s — needs recover",
@@ -72,12 +73,26 @@ class ActiveLock:
         return {**payload, "status": "orphan"}
 
 
-def _pid_alive(pid: int) -> bool:
+def _recorder_pid_alive(pid: int) -> bool:
+    """pid が「生きている recorder」かどうか。
+
+    pid の存在だけを見ると、コンテナ再起動後に別プロセスへ再利用された
+    pid を「稼働中の recorder」と誤判定し、永久に起動拒否する
+    (lock は bind mount 上に残るため。実害 2026-08-06: 再起動後に
+    :8083 が二度と上がらず、評価が録画開始で全滅した)。
+    /proc/<pid>/cmdline で本当に recorder かまで確認する。
+    """
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        # process exists but we lack signal permission -> treat as alive
+        pass  # 存在はしている — 下の同定チェックへ
+    try:
+        cmdline = (Path(f"/proc/{pid}/cmdline").read_bytes()
+                   .replace(b"\0", b" ").decode(errors="replace"))
+    except OSError:
+        # 同定できないときだけ安全側 (稼働中扱い)
         return True
+    return ("recorder_node" in cmdline
+            or "fv_episode_recorder" in cmdline)
